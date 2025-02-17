@@ -1,0 +1,454 @@
+---
+title: '**Análisis transcriptómico espacial scRNAseq**'
+output:
+  pdf_document: default
+  html_notebook: default
+---
+---
+
+Este documento contiene las notas y código necesario para analizar un conjunto de datos espaciales scRNAseq de cáncer de mama: [A single-cell and spatially resolved atlas of human breast cancers](https://www.nature.com/articles/s41588-021-00911-1#Abs1). Los datos espaciales se encuentran disponibles en el repositorio [Zenodo](https://zenodo.org/records/4739739), el cual contiene las matrices de conteo, imagenes de las inminohistoímicas, un archivo de metadatos (infomración clínica y detalles patológicos) de 6 muestras de cáncer de mama primario obtenidos con la plataforma Visium assay de 10X Genomics. 
+
+Primero se debe montar y comprender el flujo de trabajo necesario para el análisis de los datos. Debemos inicar el análisis de los datos *single cell* y posteriormente integrar los datos espaciales. Para ello iniciaremos el análisis de solo una muestra: [CID44971](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSM5354531). Esta muestra tiene un fenotipo triple negativo (TNBC), se mapeo contra el genoma de referencia GRCh38 con el programa *CellRanger Single Cell* v2.0 (10X Genomics). El procesamineto de los datos incluyó los siguientes criterios de calidad:al menos 200 genes detectados por célula, mínimo 250 UMI (*Unique Molecular Identifer*) y menos del 20% de genes mitocondriales. Estos filtros son importantes para descartar células muertas o de baja calidad. **El análisis debe realizarse únicamente con células viables.**
+
+**Dudas:** 
+
+  + La secuenciación scRNAseq contiene entre 5000-7000 células por pozo ¿estos valores son normales?¿cuál es el parámetro ideal?
+  + ¿Cómo se manejan los datos crudos de secuenciación?
+  + ¿Los filtros empleados para eliminar ruido técnico asociado a los Drops son diferentes o redundantes a los indicados en el manual de [Seurat](https://satijalab.org/seurat/articles/pbmc3k_tutorial#standard-pre-processing-workflow)?
+
+---
+
+Una vez con los datos descargados podemos empezar a trabajar. Lo primero es establecer nuestro directorio de trabajo, en él deben encontrarse los archivos necesarios para el análisis: 
+
+  + count_matrix_barcodes.tsv : Matriz con los barcodes
+  + count_matrix_genes.tsv : Matrz con los genes identificados
+  + count_matrix_sparse.mtx : Matriz de conteo (transcritos por célula)
+  + metadata.csv : Datos adicionales a la muestra
+  
+
+```{r}
+# Establecer directorio de trabajo
+setwd("D:/marval_windows/JR_MARVAL/est_INMEGEN/analyses/scrnaseq")
+list.files()
+```
+
+El siguiente paso es instalar las librerías necesarias para el análisis. La librería principal es [Seurat](https://satijalab.org/seurat/articles/pbmc3k_tutorial#standard-pre-processing-workflow). Mucho de este código esta basado en su documentación. 
+
+```{r}
+# Instalar liberias
+#install.packages("Seurat")
+library(Seurat)
+#install.packages("dylyr")
+library(dplyr)
+```
+
+Ahora cargamos los datos necesarios para el análisis, generando una matriz de genes por célula:
+
+```{r}
+# Cargar los archivos
+# Se genera una matriz genes*celulas con los valores de expresion
+counts <- ReadMtx(mtx = "count_matrix_sparse.mtx",
+                  features = "count_matrix_genes.tsv",
+                  cells = "count_matrix_barcodes.tsv",
+                  feature.column = 1) # La matriz de los genes solo tiene 1 columna
+```
+
+El siguiente paso es crear el objeto Seurat, el cual es indispensable para el manejo de los datos: 
+```{r}
+# Crear el objeto Seurat
+seurat_object <- CreateSeuratObject(counts = counts,
+                                    project = "scRNAseq_BreastCancer")
+
+# Cargar el metadata
+metadata <- read.csv("metadata.csv", row.names = 1)
+seurat_object <- AddMetaData(seurat_object, metadata)
+
+# Ver información del objeto
+seurat_object
+```
+
+**Nuestros datos constan de 29733 *features* (genes) y 7986 *samples* (células)**. Es necesario resaltar que cada transcrito representa una dimensión.
+
+---
+
+#### **Control de Calidad:**
+
+Aquí se pretende eliminar ruido técnico de los datos, evaluando el número de genes detectados por céula, pocos genes podrína representar drops vacíos y muchos genes podrían ser resultado de la lectura de más de una célula. También se considera  el número total de moléculas detectadas dentro de una célula (se correlaciona fuertemente con genes únicos). Finalmente, la presencia de genes mirocondriales es otro parametro de la validad de los datos, estos genes indican muerte y estrés celular, por ello se busca eliminarlos.
+
+Veamos los datos antes de filtrarlos:
+
+```{r}
+# Ver métricas básicas
+# Detecta genes mitocondriales
+seurat_object[["percent.mt"]] <- PercentageFeatureSet(seurat_object, 
+                                                      pattern = "^MT-")  
+
+# Visualizar QC con Violin Plots
+VlnPlot(seurat_object, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+        ncol = 3)
+```
+
+```{r}
+# Mostrar estadísticos de QC
+summary(seurat_object$nFeature_RNA)  # Genes detectados por célula
+summary(seurat_object$nCount_RNA)    # UMI totales por célula
+summary(seurat_object$percent.mt)    # Porcentaje de genes mitocondriales
+```
+Ahora veamos como cambian los datos aplicando filtros. Hemos filtrado de la siguiente manera:
+
+  + Feature RNA > 500
+  + nCount RNA < 4000
+  + percen.mt < 10
+
+Los puntos de corte se seleccionaron con base en los resultados de summary pero sigue sinedo una decisión arbitraría. 
+  
+```{r}
+# Aplicar filtros:
+dim(seurat_object)
+
+seurat_object <- subset(seurat_object, 
+                        subset = nFeature_RNA > 500 & nFeature_RNA < 4000 & 
+                          percent.mt < 10)
+
+# Revisar cuántas células quedan después del filtrado
+dim(seurat_object)
+```
+```{r}
+# Mostrar estadísticos de QC
+summary(seurat_object$nFeature_RNA)  # Genes detectados por célula
+summary(seurat_object$nCount_RNA)    # UMI totales por célula
+summary(seurat_object$percent.mt)    # Porcentaje de genes mitocondriales
+```
+
+```{r}
+# Visualizar QC con Violin Plots
+VlnPlot(seurat_object, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+        ncol = 3)
+```
+
+```{r}
+# Relación entre genes detectados y UMIs por célula
+FeatureScatter(seurat_object, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+```
+
+```{r}
+# Relación entre genes detectados y porcentaje mitocondrial
+FeatureScatter(seurat_object, feature1 = "nCount_RNA", feature2 = "percent.mt")
+```
+Con los filtros aplicados mantuve el número de transcritos pero hubo una pérdida de células. La relación entre el número de genes y el de moléculas de RNA es fuerte, lo que representa un buen indicio de la calidad de los datos. 
+
+**Dudas:**
+
+  + ¿Cómo se establecen los parámetros de calidad?¿Cómo saber los valores óptimos?
+
+---
+
+#### **Normalización:**
+
+En este paso se pretende remover ruido técnico del análisis para tratar de garantizar que las conclusiones obtenidas son biológicamente relevantes y no se deben a rudio técnico. El método utilizado por Seurat, asume que cada célula contiene el mismo número de moléculas de RNA. 
+
+```{r}
+seurat_object <- NormalizeData(seurat_object,
+                               normalization.method = "LogNormalize", 
+                               scale.factor = 10000)
+```
+
+```{r}
+# Cuentas originales vs. normalizadas
+# Cuentas originales log-transformadas
+seurat_object$log_counts <- log1p(seurat_object$nCount_RNA)
+
+# Visualización con gráficos de violín
+VlnPlot(seurat_object, features = c("log_counts", "nCount_RNA"), 
+        group.by = "orig.ident", 
+        pt.size = 0.1, 
+        split.by = "orig.ident")
+```
+
+```{r}
+# Comparar la distribución de características clave 
+#(genes detectados, cuentas y log-transformed counts)
+VlnPlot(seurat_object, features = c("nFeature_RNA", "nCount_RNA", "log_counts"),
+        ncol = 3)
+```
+
+```{r}
+FeatureScatter(seurat_object, feature1 = "nCount_RNA", feature2 = "log_counts")
+```
+
+---
+
+#### **Identificación de genes con alta variabilidad:**
+
+Este paso tiene como objetivo enfocar el análisis en los genes más variables con lo cual se pueden detectar señales biológicas interesantes. Además, ayuda a reducir la dimensionalidad de los datos y mejorar la identificación de poblaciones celulares.
+
+```{r}
+# Normalización usando el método de varianza estabilizada.
+seurat_object <- FindVariableFeatures(seurat_object, 
+                                      selection.method = "vst", 
+                                      nfeatures = 1000)
+```
+
+```{r}
+# Plot de variabilidad
+VariableFeaturePlot(seurat_object)
+# Identifiacion de genes top
+top <- head(VariableFeatures(seurat_object),8)
+LabelPoints(plot = VariableFeaturePlot(seurat_object), points = top, 
+            repel = TRUE,
+            max.overlaps = 20, xnudge = 0.01, ynudge = 0.01)
+```
+**Dudas:**
+
+  + ¿Cómo se determina cuántos genes tomar en el parámetro *nfeatures*?
+  
+---
+
+#### **Escalamiento:**
+
+Este es un paso previo a la reducción de dimensionalidad, en cual los datos se transforman para tener una media de cero y varianza de uno. Esto genera que todos los genes tengan el mismo peso, así no hay un domino o un sesgo por genes altamente expresados. Por default se realiza sobre las características con mayor variabilidad.
+
+```{r}
+# Para todos los genes del análisis
+all.genes <- rownames(seurat_object)
+seurat_object <- ScaleData(seurat_object, features = all.genes)
+DoHeatmap(seurat_object, features = sample(all.genes, 30))
+```
+
+Usando los genes de alta variabilidad:
+
+```{r}
+# Para todos los genes de alta variabilidad
+seurat_object <- ScaleData(seurat_object, 
+                           features = VariableFeatures(seurat_object))
+DoHeatmap(seurat_object, features = head(VariableFeatures(seurat_object), 30))
+```
+
+**Dudas:**
+
+  + ¿Este paso es valido, no reduce la variación biológica de los datos pudiendo perder señales fuertes?
+  + ¿Qué datos se usan en el escalamiento?¿Todos los genes o solo los altamente variables?
+
+---
+
+#### **Reducción de dimensionalidad:**
+
+Este paso se realiza sobre los datos escalados y busca representar en un espacio de menos dimensiones la complejidad dimensional de los datos. 
+
+```{r}
+# PCA
+seurat_object <- RunPCA(seurat_object, 
+                        features = VariableFeatures(seurat_object))
+```
+
+Exploremos un poco el análsis:
+```{r}
+# Exploracion de los datos
+print(seurat_object[["pca"]], dims = 1:5, nfeatures = 5)
+```
+
+```{r}
+# Plot de carga
+VizDimLoadings(seurat_object, dims = 1:2, reduction = "pca")
+```
+```{r}
+# Vista del PCA
+DimPlot(seurat_object, reduction = "pca")# + NoLegend()
+```
+Conocer el número de componentes principales que definen nuestro set de datos es importante para la definición de clusters.
+
+```{r}
+# Como saber cuantos PC seleccionar?
+DimHeatmap(seurat_object, dims = 1, cells = 500, balanced = TRUE)
+```
+
+```{r}
+DimHeatmap(seurat_object, dims = 1:5, cells = 500, balanced = TRUE)
+```
+**¡La elección de cuantos PC utilizar es una dicisión complicada!** El método del codo es una opción. La función de este plor en Seurat está limitada a 50 PC.
+
+```{r}
+# Para determinar cuántos PC usar
+ElbowPlot(seurat_object, ndims = 50)
+```
+Prueba de JackStraw (Significancia estadística), si el PC tiene una p < 0.05 es importante para el análisis:
+
+```{r}
+# Cs significativos, 20 PC es el default
+seurat_object <- JackStraw(seurat_object, num.replicate = 100)
+seurat_object <- ScoreJackStraw(seurat_object, dims = 1:20)
+JackStrawPlot(seurat_object, dims = 1:20)
+```
+Varianza explicada: 
+
+```{r}
+# Umbral de varianza
+# Obtener la desviación estándar de cada PC
+stdev <- seurat_object[["pca"]]@stdev
+# Seleccionar PCs donde la varianza explicada sea mayor a 1
+num_pcs <- sum(stdev > 1)
+cat("Número óptimo de PCs:", num_pcs, "\n")
+```
+Varianza acumulada:
+
+```{r}
+# Visualiza la proporción de varianza explicada por cada componente principal
+seurat_object[["pca"]]@stdev
+```
+
+```{r}
+# Calcula la proporción de varianza explicada
+var_explained <- seurat_object[["pca"]]@stdev^2 / sum(seurat_object[["pca"]]@stdev^2)
+# Visualiza la varianza explicada acumulada
+cumsum(var_explained)
+```
+
+```{r}
+# Encuentra el número de PCs que explican el 90% de la varianza
+pc_90 <- which(cumsum(var_explained) >= 0.90)[1]
+pc_90
+```
+**Dudas:**
+
+  + ¿Cuál es el mejor método para seleccionar el número de PC a conservar?
+  
+---
+
+#### **Clustering:**
+
+Con base en los PC definidos se establecen los clusters inferidos en los datos. El método esta basado en grafos, de tal forma que células con patrones de expresión similares en ss genes-nodos tienden a mantenerse cercanas formando cliques y comunidades densamente conectados. 
+
+```{r}
+# Construye las redes de vecinos, considerando  el # de PC a retener
+seurat_object <- FindNeighbors(seurat_object, dims = 1:50)
+# Determina el número de clusters
+seurat_object <- FindClusters(seurat_object, resolution = 0.1)
+# Cluster IDs of the first 5 cells
+head(Idents(seurat_object), 5)
+```
+Una vez con la genración de los clusters, podemos construir la representación gráfica en un espacio de menos dimensiones.
+
+```{r}
+# Realizar la reducción de dimensiones con UMAP
+seurat_object <- RunUMAP(seurat_object, dims = 1:50)
+# Visualizar los clusters en un gráfico UMAP
+DimPlot(seurat_object, reduction = "umap")#, group.by = "seurat_clusters")
+```
+
+```{r}
+# Realizar la reducción de dimensiones con t-SNE
+seurat_object <- RunTSNE(seurat_object, dims = 1:50)
+# Visualizar los clusters en un gráfico t-SNE
+DimPlot(seurat_object, reduction = "tsne")#, group.by = "seurat_clusters")
+```
+
+Este es un buen punto para guardar el anális:
+
+```{r}
+# Salvar resultado
+saveRDS(seurat_object, file = "sc_rnaseq_test.rds")
+```
+
+**Dudas:**
+
+  + ¿Qué es la resolución?¿Cómo determinar su valor óptimo?
+  + ¿Cómo discernir entre representar con UMAP o TSNE?
+
+---
+
+#### **Identificación de biomarcadores:**
+
+Aquí con base en los genes expresados diferencialmente se encuentran los marcadores que mejor definen cada uno de los clusters. 
+
+```{r}
+# Encontrar marcadores para cada cluster comparando contra todas las céluas
+pbmc.markers <- FindAllMarkers(seurat_object, only.pos = TRUE)
+pbmc.markers %>%
+  group_by(cluster) %>%
+  dplyr::filter(avg_log2FC > 1)
+```
+
+Una vez realizado el análisis de expresión diferencial, podemos explorar la expresión de marcadores a través de cada uno de los clusters.
+
+```{r}
+# Visualizar los marcadores en cada cluster
+VlnPlot(seurat_object, features = c("IL7R", "CCR7"))
+```
+```{r}
+# Plot raw counts
+VlnPlot(seurat_object, features = c("IL7R", "CCR7"), slot = "counts", log = TRUE)
+```
+
+Pespectiva global de la distribución de un marcador en los clusters visualizado en el UMAP.
+
+```{r}
+# Visualzar en el UMAP/TSNE
+FeaturePlot(seurat_object, features = c("IL7R", "CCR7"))
+```
+
+Visualización de los marcadores en un heatmap.
+
+```{r}
+# Heatmap
+pbmc.markers %>%
+  group_by(cluster) %>%
+  dplyr::filter(avg_log2FC > 1) %>%
+  slice_head(n = 2) %>%
+  ungroup() -> top10
+```
+
+```{r}
+DoHeatmap(seurat_object, features = top10$gene) + NoLegend()
+```
+**Dudas:**
+
+  + ¿Cómo se cuáles son los marcadores ideales?¿Expresión, teoría de grafos, literatura?
+  
+---
+
+#### **Asiganación de tipos celulares**
+
+Este es último paso y consiste en identificar poblaciones celulares, es decir, asifnar un fenotipo a cada uno de los clusters con base en sus marcadores característicos. 
+
+```{r}
+new.cluster.ids <- c("Naive CD4 T", "CD14+ Mono", "Memory CD4 T", "B", 
+                     "CD8 T", "FCGR3A+ Mono",
+                     "NK", "DC", "Platelet",
+                     rep("Unknown", 6))
+
+names(new.cluster.ids) <- levels(seurat_object)
+seurat_object <- RenameIdents(seurat_object, new.cluster.ids)
+DimPlot(seurat_object, reduction = "umap", 
+        label = TRUE, pt.size = 0.5) + NoLegend()
+```
+
+```{r}
+library(ggplot2)
+```
+
+```{r}
+plot <- DimPlot(seurat_object, reduction = "umap", label = TRUE, label.size = 3.5) +
+  xlab("UMAP 1") + 
+  ylab("UMAP 2") +
+  theme(axis.title = element_text(size = 12), 
+        legend.text = element_text(size = 10)) +
+  guides(colour = guide_legend(override.aes = list(size = 5)))
+
+plot
+```
+
+**Dudas:**
+
+  + ¿La asignación se puede hacer de forma autómatica?
+  
+---
+
+#### **Integración con los datos espaciales:**
+
+**¡Proximamente!** 
+
+```{r}
+sessionInfo()
+```
+
+
